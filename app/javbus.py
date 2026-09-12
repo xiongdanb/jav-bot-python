@@ -167,8 +167,7 @@ def extract_ajax_params(html: str):
         result
     )
 
-    # 这里不能使用 all(result.values())
-    # 因为 uc=0，字符串 "0" 虽然是真值，但做明确判断更安全
+    # 明确判断 None，避免 uc=0 等特殊情况
     if (
         result["gid"] is not None
         and result["uc"] is not None
@@ -251,33 +250,48 @@ async def query_javbus(raw_code: str) -> dict:
             )
 
         # 提取封面
+        # 优先获取 a.bigImage 的 href，通常这是大封面地址
+        image_link = soup.select_one(
+            "a.bigImage"
+        )
+
         image = soup.select_one(
             "a.bigImage img"
         )
 
-        if not image:
+        if not image_link and not image:
             # 尝试其他常见图片选择器
             image = soup.select_one(
                 "img"
             )
 
-        if not image:
+        if not image_link and not image:
             raise RuntimeError(
                 "页面中没有找到封面，"
                 "可能是访问被拦截、页面结构变化或番号不存在。"
                 "网页已保存为 debug_page.html"
             )
 
-        title = (
-            image.get("title")
-            or image.get("alt")
-            or code
-        )
+        if image:
+            title = (
+                image.get("title")
+                or image.get("alt")
+                or code
+            )
+        else:
+            title = code
 
-        cover = image.get(
-            "src",
-            ""
-        ).strip()
+        # 优先使用大封面链接
+        if image_link:
+            cover = image_link.get(
+                "href",
+                ""
+            ).strip()
+        else:
+            cover = image.get(
+                "src",
+                ""
+            ).strip()
 
         if cover:
             cover = urljoin(
