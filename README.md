@@ -102,7 +102,7 @@ pip install -r requirements.txt
 
 ```env
 BOT_TOKEN=填写你的Telegram机器人Token
-ADMIN_IDS=填写自己的Telegram作为管理员ID
+ADMIN_IDS=填写自己的TelegramID作为管理员ID
 
 JAVBUS_BASE_URL=https://www.javbus.com
 DATABASE_PATH=./data/bot.db
