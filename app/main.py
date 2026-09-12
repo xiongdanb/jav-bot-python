@@ -1,9 +1,11 @@
 import asyncio
 import html
 
+import httpx
+
 from aiogram import Bot, Dispatcher, Router
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import Message, BufferedInputFile
 from aiogram.enums import ChatType, ParseMode
 from aiogram.client.default import DefaultBotProperties
 
@@ -101,12 +103,35 @@ async def av_handler(message: Message):
             f"📤 当前显示前 {len(selected_magnets)} 个"
         )
 
+        # 由 VPS 先下载封面，再上传到 Telegram
         if cover:
             try:
+                async with httpx.AsyncClient(
+                    headers={
+                        "User-Agent": (
+                            "Mozilla/5.0 "
+                            "(Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 "
+                            "(KHTML, like Gecko) "
+                            "Chrome/131.0.0.0 Safari/537.36"
+                        )
+                    },
+                    timeout=20,
+                    follow_redirects=True,
+                ) as client:
+                    response = await client.get(cover)
+                    response.raise_for_status()
+
+                photo = BufferedInputFile(
+                    response.content,
+                    filename="cover.jpg",
+                )
+
                 await message.answer_photo(
-                    photo=cover,
+                    photo=photo,
                     caption=summary,
                 )
+
             except Exception as exc:
                 print(
                     f"[封面发送失败] "
