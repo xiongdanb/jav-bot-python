@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+
+.env
+
+data/
+*.db
+
+debug_page.html
+debug_ajax.html
+test_result.json
