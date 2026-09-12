@@ -106,6 +106,11 @@ async def av_handler(message: Message):
         # 由 VPS 先下载封面，再上传到 Telegram
         if cover:
             try:
+                # 使用当前番号页面作为 Referer，避免图片防盗链 403
+                page_url = (
+                    f"https://www.javbus.com/{code}"
+                )
+
                 async with httpx.AsyncClient(
                     headers={
                         "User-Agent": (
@@ -114,7 +119,13 @@ async def av_handler(message: Message):
                             "AppleWebKit/537.36 "
                             "(KHTML, like Gecko) "
                             "Chrome/131.0.0.0 Safari/537.36"
-                        )
+                        ),
+                        "Referer": page_url,
+                        "Accept": (
+                            "image/avif,image/webp,"
+                            "image/apng,image/svg+xml,"
+                            "image/*,*/*;q=0.8"
+                        ),
                     },
                     timeout=20,
                     follow_redirects=True,
@@ -138,6 +149,7 @@ async def av_handler(message: Message):
                     f"{type(exc).__name__}: {exc}"
                 )
 
+                # 即使封面失败，也继续发送文字和磁力链接
                 await message.answer(summary)
         else:
             await message.answer(summary)
