@@ -1,7 +1,6 @@
 import asyncio
 import html
 import logging
-import time
 
 from aiogram import Bot, Dispatcher, Router
 from aiogram.client.default import DefaultBotProperties
@@ -14,10 +13,17 @@ from app.config import (
     GROUP_MAX_MAGNETS,
     PRIVATE_MAX_MAGNETS,
     USER_COOLDOWN_SECONDS,
+    TELEGRAM_SEND_CONCURRENCY,
     JAVBUS_BASE_URL,
     validate_runtime_config,
 )
-from app.database import add_query, add_user, init_db, prune_cache
+from app.database import (
+    acquire_query_cooldown,
+    add_query,
+    add_user,
+    init_db,
+    prune_cache,
+)
 from app.javbus import (
     BlockedError,
     FetchError,
@@ -38,7 +44,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 router = Router()
-_last_request_at: dict[tuple[int, int], float] = {}
+_telegram_send_semaphore = asyncio.Semaphore(TELEGRAM_SEND_CONCURRENCY)
 
 
 @router.message(Command("start"))
@@ -70,6 +76,11 @@ def _error_message(exc: JavBusError) -> str:
 
 
 async def _send_result(message: Message, result: dict, max_magnets: int) -> None:
+    async with _telegram_send_semaphore:
+        await _send_result_limited(message, result, max_magnets)
+
+
+async def _send_result_limited(message: Message, result: dict, max_magnets: int) -> None:
     code = result["code"]
     title = result["title"]
     cover = result["cover"]
@@ -136,22 +147,11 @@ async def av_handler(message: Message):
         return
     await add_user(user.id)
 
-    now = time.monotonic()
-    key = (message.chat.id, user.id)
-    previous = _last_request_at.get(key, 0)
-    if now - previous < USER_COOLDOWN_SECONDS:
+    if not await acquire_query_cooldown(
+        message.chat.id, user.id, USER_COOLDOWN_SECONDS
+    ):
         await message.answer("查询太频繁，请稍等几秒再试。")
         return
-    _last_request_at[key] = now
-    if len(_last_request_at) > 10000:
-        cutoff = now - max(USER_COOLDOWN_SECONDS * 10, 60)
-        recent_requests = {
-            entry: timestamp
-            for entry, timestamp in _last_request_at.items()
-            if timestamp >= cutoff
-        }
-        _last_request_at.clear()
-        _last_request_at.update(recent_requests)
 
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:

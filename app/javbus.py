@@ -1,18 +1,18 @@
 import asyncio
+import ipaddress
 import logging
 import random
 import re
-from pathlib import Path
-from urllib.parse import urljoin
+import socket
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
 
 from .config import (
-    DEBUG_DIR,
-    DEBUG_SAVE_HTML,
     JAVBUS_BASE_URL,
     MAX_CONCURRENT_FETCHES,
+    UPSTREAM_ALLOWED_HOSTS,
 )
 from .database import get_cache, set_cache
 
@@ -65,7 +65,7 @@ async def start_http_client() -> None:
         _client = httpx.AsyncClient(
             headers=HEADERS,
             timeout=httpx.Timeout(20),
-            follow_redirects=True,
+            follow_redirects=False,
             limits=httpx.Limits(max_connections=MAX_CONCURRENT_FETCHES * 2),
         )
 
@@ -81,13 +81,12 @@ async def download_cover(url: str, referer: str) -> bytes:
     await start_http_client()
     assert _client is not None
     async with _fetch_semaphore:
-        response = await _client.get(
-            url,
-            headers={"Referer": referer, "Accept": "image/*"},
+        response = await _request(
+            _client, url, headers={"Referer": referer, "Accept": "image/*"}
         )
         response.raise_for_status()
         if len(response.content) > 10 * 1024 * 1024:
-            raise FetchError("封面图片超过 10 MB。")
+            raise FetchError("Cover image exceeds 10 MB.")
         return response.content
 
 
@@ -110,7 +109,7 @@ async def fetch_text(
     last_error: Exception | None = None
     for attempt in range(3):
         try:
-            response = await client.get(url, params=params, headers=headers)
+            response = await _request(client, url, params=params, headers=headers)
             if response.status_code in {429, 500, 502, 503, 504}:
                 response.raise_for_status()
             response.raise_for_status()
@@ -126,6 +125,66 @@ async def fetch_text(
         if attempt < 2:
             await asyncio.sleep(1.5 * (attempt + 1))
     raise FetchError("请求目标站失败，请稍后重试。") from last_error
+
+
+async def _validate_target(url: str) -> None:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not host
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.port not in {None, 80, 443}
+        or host not in UPSTREAM_ALLOWED_HOSTS
+    ):
+        raise FetchError("Upstream URL is not permitted by the host allowlist.")
+    try:
+        addresses = await asyncio.get_running_loop().getaddrinfo(
+            host,
+            parsed.port or (443 if parsed.scheme == "https" else 80),
+            type=socket.SOCK_STREAM,
+        )
+    except socket.gaierror as exc:
+        raise FetchError("Could not resolve the upstream host.") from exc
+    if not addresses or any(
+        not ipaddress.ip_address(item[4][0].split("%")[0]).is_global
+        for item in addresses
+    ):
+        raise FetchError("Upstream host resolves to a non-public IP address.")
+
+
+async def _request(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    params: dict[str, str] | None = None,
+    headers: dict[str, str] | None = None,
+) -> httpx.Response:
+    current_url = url
+    current_params = params
+    current_headers = headers
+    for redirect_count in range(6):
+        await _validate_target(current_url)
+        response = await client.get(
+            current_url,
+            params=current_params,
+            headers=current_headers,
+        )
+        if response.status_code not in {301, 302, 303, 307, 308}:
+            return response
+        location = response.headers.get("Location")
+        if not location or redirect_count == 5:
+            raise FetchError("Too many or malformed upstream redirects.")
+        next_url = urljoin(str(response.url), location)
+        if urlparse(next_url).hostname != urlparse(current_url).hostname:
+            current_headers = {
+                key: value for key, value in (current_headers or {}).items()
+                if key.lower() not in {"authorization", "cookie", "referer"}
+            }
+        current_url = next_url
+        current_params = None
+    raise FetchError("Too many upstream redirects.")
 
 
 def extract_value(text: str, key: str) -> str | None:
@@ -152,15 +211,6 @@ def extract_ajax_params(page_html: str) -> dict[str, str] | None:
     return None
 
 
-def _save_debug(name: str, content: str) -> None:
-    if not DEBUG_SAVE_HTML:
-        return
-    directory = Path(DEBUG_DIR)
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{name}-{int(asyncio.get_running_loop().time() * 1000)}.html"
-    path.write_text(content, encoding="utf-8")
-
-
 def _check_blocked(page_html: str) -> None:
     lowered = page_html.lower()
     blocked_markers = (
@@ -175,7 +225,6 @@ async def _scrape(code: str, client: httpx.AsyncClient) -> dict:
     page_url = f"{JAVBUS_BASE_URL}/{code}"
     async with _fetch_semaphore:
         page_html = await fetch_text(client, page_url)
-        await asyncio.to_thread(_save_debug, f"page-{code}", page_html)
         _check_blocked(page_html)
 
         soup = BeautifulSoup(page_html, "html.parser")
@@ -210,7 +259,6 @@ async def _scrape(code: str, client: httpx.AsyncClient) -> dict:
             params={**ajax_params, "lang": "zh", "floor": str(random.randint(1, 1000))},
             headers={"Referer": page_url, "X-Requested-With": "XMLHttpRequest"},
         )
-        await asyncio.to_thread(_save_debug, f"ajax-{code}", ajax_html)
         ajax_soup = BeautifulSoup(ajax_html, "html.parser")
         magnets = []
         for row in ajax_soup.select("tr"):

@@ -30,16 +30,18 @@ python -m app.main
 | `BOT_TOKEN` | 空 | Telegram Bot Token，必填 |
 | `JAVBUS_BASE_URL` | `https://www.javbus.com` | 查询站点的 HTTP(S) 根地址 |
 | `DATABASE_PATH` | `./data/bot.db` | SQLite 数据库路径 |
-| `CACHE_TTL` | `21600` | 查询缓存秒数 |
+| `MAGNET_CACHE_TTL` | `1800` | 磁力信息缓存秒数 |
+| `UPSTREAM_ALLOWED_HOSTS` | `www.javbus.com` | 查询站和图片允许访问的主机名，逗号分隔；必须包含站点主机 |
 | `GROUP_MAX_MAGNETS` | `3` | 群聊最多显示的磁力链接数 |
 | `PRIVATE_MAX_MAGNETS` | `20` | 私聊最多显示的磁力链接数 |
 | `MAX_CONCURRENT_FETCHES` | `3` | 同时进行的上游请求上限 |
 | `USER_COOLDOWN_SECONDS` | `3` | 同一用户在同一聊天的查询间隔 |
-| `DEBUG_SAVE_HTML` | `false` | 是否保存上游 HTML 以排查解析问题 |
-| `DEBUG_DIR` | `./debug` | 调试 HTML 保存目录 |
 | `STATISTICS_TIMEZONE` | `Asia/Shanghai` | 每日统计所用 IANA 时区 |
+| `TELEGRAM_SEND_CONCURRENCY` | `2` | 同时发送结果的聊天数上限 |
 
-调试 HTML 可能包含上游页面内容，默认关闭；启用后应妥善保护和定期清理该目录。
+出于安全考虑，程序仅请求允许列表中的公网主机，并逐跳校验 HTTP 重定向；如果封面使用 CDN，请把 CDN 主机加入 `UPSTREAM_ALLOWED_HOSTS`。程序不会把完整上游 HTML 写入磁盘。
+
+需要完全固定依赖版本时，使用 `pip install -r requirements.lock`；更新依赖后应重新生成并提交锁文件。
 
 ## 命令
 
