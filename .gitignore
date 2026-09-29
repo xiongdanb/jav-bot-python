@@ -1,12 +1,15 @@
+# Python bytecode and environments
 .venv/
 __pycache__/
-*.pyc
+*.py[cod]
 
+# Secrets and runtime data
 .env
-
 data/
 *.db
 
+# Optional captured upstream pages
+debug/
 debug_page.html
 debug_ajax.html
 test_result.json

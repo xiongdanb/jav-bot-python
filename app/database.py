@@ -2,10 +2,13 @@ import json
 import os
 import time
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import aiosqlite
 
-from .config import DATABASE_PATH, CACHE_TTL
+from .config import DATABASE_PATH, CACHE_TTL, STATISTICS_TIMEZONE
+
+_stats_timezone = ZoneInfo(STATISTICS_TIMEZONE)
 
 
 async def init_db():
@@ -41,7 +44,7 @@ async def init_db():
 
 
 async def add_query():
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(_stats_timezone).strftime("%Y-%m-%d")
 
     async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute("""
@@ -68,7 +71,10 @@ async def add_user(user_id: int):
 
 
 async def get_stats(days: int = 5):
-    start_date = datetime.now() - timedelta(days=days)
+    if days < 1:
+        raise ValueError("days must be at least 1")
+    today = datetime.now(_stats_timezone).date()
+    start_date = today - timedelta(days=days - 1)
 
     async with aiosqlite.connect(DATABASE_PATH) as db:
         cursor = await db.execute("""
@@ -110,6 +116,9 @@ async def get_cache(code: str):
     data, updated_at = row
 
     if int(time.time()) - updated_at > CACHE_TTL:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute("DELETE FROM cache WHERE code = ?", (code,))
+            await db.commit()
         return None
 
     try:
@@ -133,4 +142,11 @@ async def set_cache(code: str, data: dict):
             int(time.time()),
         ))
 
+        await db.commit()
+
+
+async def prune_cache():
+    cutoff = int(time.time()) - CACHE_TTL
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("DELETE FROM cache WHERE updated_at < ?", (cutoff,))
         await db.commit()

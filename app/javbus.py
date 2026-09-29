@@ -1,460 +1,275 @@
 import asyncio
+import logging
 import random
 import re
 from pathlib import Path
-from urllib.parse import unquote, urljoin
+from urllib.parse import urljoin
 
 import httpx
 from bs4 import BeautifulSoup
 
-from .config import JAVBUS_BASE_URL
+from .config import (
+    DEBUG_DIR,
+    DEBUG_SAVE_HTML,
+    JAVBUS_BASE_URL,
+    MAX_CONCURRENT_FETCHES,
+)
+from .database import get_cache, set_cache
 
 
+logger = logging.getLogger(__name__)
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 "
-        "(KHTML, like Gecko) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/131.0.0.0 Safari/537.36"
     ),
-    "Accept": (
-        "text/html,application/xhtml+xml,"
-        "application/xml;q=0.9,"
-        "image/avif,image/webp,image/apng,"
-        "*/*;q=0.8"
-    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-    "Cache-Control": "no-cache",
 }
 
 
-def normalize_code(raw: str) -> str:
-    """
-    将番号统一为类似 SSIS-001 的格式。
+class JavBusError(Exception):
+    """Base error for lookup failures that can be shown safely to users."""
 
-    支持：
-    SSIS-001
-    ssis001
-    SSIS_001
-    SSIS 001
-    """
 
-    raw = raw.strip().upper()
-    raw = raw.replace("_", "-")
-    raw = re.sub(r"\s+", "-", raw)
+class InvalidCodeError(JavBusError):
+    pass
 
-    match = re.fullmatch(
-        r"([A-Z]+)-?(\d+)",
-        raw
-    )
 
-    if not match:
-        raise ValueError(
-            "番号格式不正确，例如 SSIS-001"
+class NotFoundError(JavBusError):
+    pass
+
+
+class BlockedError(JavBusError):
+    pass
+
+
+class ParseError(JavBusError):
+    pass
+
+
+class FetchError(JavBusError):
+    pass
+
+
+_client: httpx.AsyncClient | None = None
+_fetch_semaphore = asyncio.Semaphore(MAX_CONCURRENT_FETCHES)
+_inflight: dict[str, asyncio.Task] = {}
+_inflight_guard = asyncio.Lock()
+
+
+async def start_http_client() -> None:
+    global _client
+    if _client is None:
+        _client = httpx.AsyncClient(
+            headers=HEADERS,
+            timeout=httpx.Timeout(20),
+            follow_redirects=True,
+            limits=httpx.Limits(max_connections=MAX_CONCURRENT_FETCHES * 2),
         )
 
-    prefix, number = match.groups()
 
+async def close_http_client() -> None:
+    global _client
+    if _client is not None:
+        await _client.aclose()
+        _client = None
+
+
+async def download_cover(url: str, referer: str) -> bytes:
+    await start_http_client()
+    assert _client is not None
+    async with _fetch_semaphore:
+        response = await _client.get(
+            url,
+            headers={"Referer": referer, "Accept": "image/*"},
+        )
+        response.raise_for_status()
+        if len(response.content) > 10 * 1024 * 1024:
+            raise FetchError("封面图片超过 10 MB。")
+        return response.content
+
+
+def normalize_code(raw: str) -> str:
+    normalized = re.sub(r"\s+", "-", raw.strip().upper().replace("_", "-"))
+    match = re.fullmatch(r"([A-Z]+)-?(\d+)", normalized)
+    if not match:
+        raise InvalidCodeError("番号格式不正确，请使用类似 SSIS-001 的格式。")
+    prefix, number = match.groups()
     return f"{prefix}-{number}"
 
 
 async def fetch_text(
     client: httpx.AsyncClient,
     url: str,
-    **kwargs
+    *,
+    params: dict[str, str] | None = None,
+    headers: dict[str, str] | None = None,
 ) -> str:
-    """
-    请求网页，失败自动重试三次。
-    """
-
-    last_error = None
-
+    last_error: Exception | None = None
     for attempt in range(3):
         try:
-            response = await client.get(
-                url,
-                timeout=20,
-                follow_redirects=True,
-                **kwargs
-            )
-
+            response = await client.get(url, params=params, headers=headers)
+            if response.status_code in {429, 500, 502, 503, 504}:
+                response.raise_for_status()
             response.raise_for_status()
-
             return response.text
-
-        except Exception as exc:
+        except httpx.HTTPStatusError as exc:
             last_error = exc
-
-            print(
-                f"[请求失败] 第 {attempt + 1}/3 次："
-                f"{type(exc).__name__}: {exc}"
-            )
-
-            if attempt < 2:
-                await asyncio.sleep(
-                    1.5 * (attempt + 1)
-                )
-
-    raise last_error
+            if exc.response.status_code < 500 and exc.response.status_code != 429:
+                raise FetchError(
+                    f"目标站返回 HTTP {exc.response.status_code}"
+                ) from exc
+        except httpx.RequestError as exc:
+            last_error = exc
+        if attempt < 2:
+            await asyncio.sleep(1.5 * (attempt + 1))
+    raise FetchError("请求目标站失败，请稍后重试。") from last_error
 
 
-def extract_value(text: str, key: str):
-    """
-    从 JS 或 HTML 中提取变量值。
-
-    支持以下形式：
-
-    var gid = 45622817370;
-    var uc = 0;
-    var img = '/pics/cover/xxx.jpg';
-
-    var gid = '123';
-    gid = "123";
-    gid: '123';
-    "gid": "123";
-    const gid = '123';
-    gid: 123;
-    """
-
+def extract_value(text: str, key: str) -> str | None:
     escaped_key = re.escape(key)
-
-    patterns = [
-        # var gid = 123;
+    patterns = (
         rf"\b{escaped_key}\s*=\s*([0-9]+)\s*;?",
-
-        # var gid = 'xxx';
         rf"\b{escaped_key}\s*=\s*['\"]([^'\"]+)['\"]",
-
-        # gid: 'xxx'
         rf"\b{escaped_key}\s*:\s*['\"]([^'\"]+)['\"]",
-
-        # "gid": "xxx"
         rf"['\"]{escaped_key}['\"]\s*:\s*['\"]([^'\"]+)['\"]",
-
-        # gid: 123
         rf"\b{escaped_key}\s*:\s*([0-9]+)",
-
-        # "gid": 123
         rf"['\"]{escaped_key}['\"]\s*:\s*([0-9]+)",
-    ]
-
+    )
     for pattern in patterns:
-        match = re.search(
-            pattern,
-            text,
-            flags=re.IGNORECASE
-        )
-
+        match = re.search(pattern, text, flags=re.IGNORECASE)
         if match:
             return match.group(1).strip()
-
     return None
 
 
-def extract_ajax_params(html: str):
-    """
-    从页面 HTML / JS 中提取 JavBus AJAX 所需参数。
-    """
+def extract_ajax_params(page_html: str) -> dict[str, str] | None:
+    values = {key: extract_value(page_html, key) for key in ("gid", "uc", "img")}
+    if all(value is not None for value in values.values()):
+        return values  # type: ignore[return-value]
+    return None
 
-    result = {
-        "gid": extract_value(html, "gid"),
-        "uc": extract_value(html, "uc"),
-        "img": extract_value(html, "img"),
-    }
 
-    print(
-        "[参数提取结果]",
-        result
+def _save_debug(name: str, content: str) -> None:
+    if not DEBUG_SAVE_HTML:
+        return
+    directory = Path(DEBUG_DIR)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{name}-{int(asyncio.get_running_loop().time() * 1000)}.html"
+    path.write_text(content, encoding="utf-8")
+
+
+def _check_blocked(page_html: str) -> None:
+    lowered = page_html.lower()
+    blocked_markers = (
+        "just a moment", "checking your browser", "cf-chl",
+        "access denied", "captcha", "verify you are human",
     )
-
-    # 明确判断 None，避免 uc=0 等特殊情况
-    if (
-        result["gid"] is not None
-        and result["uc"] is not None
-        and result["img"] is not None
-    ):
-        return result
-
-    return None
+    if any(marker in lowered for marker in blocked_markers):
+        raise BlockedError("目标站要求验证或暂时拒绝访问。")
 
 
-async def query_javbus(raw_code: str) -> dict:
-    """
-    查询 JavBus 页面并获取 Magnet 信息。
-    """
-
-    code = normalize_code(raw_code)
-
+async def _scrape(code: str, client: httpx.AsyncClient) -> dict:
     page_url = f"{JAVBUS_BASE_URL}/{code}"
+    async with _fetch_semaphore:
+        page_html = await fetch_text(client, page_url)
+        await asyncio.to_thread(_save_debug, f"page-{code}", page_html)
+        _check_blocked(page_html)
 
-    print(
-        f"[开始请求] {page_url}"
-    )
-
-    async with httpx.AsyncClient(
-        headers=HEADERS,
-        follow_redirects=True
-    ) as client:
-
-        html = await fetch_text(
-            client,
-            page_url
-        )
-
-        # 保存网页源码，方便调试
-        debug_path = Path(
-            "debug_page.html"
-        )
-
-        debug_path.write_text(
-            html,
-            encoding="utf-8"
-        )
-
-        print(
-            f"[网页已保存] {debug_path.absolute()}"
-        )
-
-        print(
-            f"[网页长度] {len(html)} 字符"
-        )
-
-        soup = BeautifulSoup(
-            html,
-            "html.parser"
-        )
-
-        # 检查是否是 Cloudflare / 验证页面
-        lower_html = html.lower()
-
-        blocked_keywords = [
-            "just a moment",
-            "checking your browser",
-            "cf-chl",
-            "cloudflare",
-            "access denied",
-            "captcha",
-            "verify you are human",
-        ]
-
-        found_block_keyword = [
-            keyword
-            for keyword in blocked_keywords
-            if keyword in lower_html
-        ]
-
-        if found_block_keyword:
-            print(
-                "[警告] 页面可能是验证页，命中关键词：",
-                found_block_keyword
-            )
-
-        # 提取封面
-        # 优先获取 a.bigImage 的 href，通常这是大封面地址
-        image_link = soup.select_one(
-            "a.bigImage"
-        )
-
-        image = soup.select_one(
-            "a.bigImage img"
-        )
-
+        soup = BeautifulSoup(page_html, "html.parser")
+        image_link = soup.select_one("a.bigImage")
+        image = soup.select_one("a.bigImage img")
         if not image_link and not image:
-            # 尝试其他常见图片选择器
-            image = soup.select_one(
-                "img"
-            )
-
+            image = soup.select_one("img")
         if not image_link and not image:
-            raise RuntimeError(
-                "页面中没有找到封面，"
-                "可能是访问被拦截、页面结构变化或番号不存在。"
-                "网页已保存为 debug_page.html"
-            )
+            if re.search(r"404|not found|不存在", soup.get_text(" ", strip=True), re.I):
+                raise NotFoundError("没有找到这个番号。")
+            raise ParseError("页面中没有找到封面，目标站页面可能已变化。")
 
-        if image:
-            title = (
-                image.get("title")
-                or image.get("alt")
-                or code
-            )
-        else:
-            title = code
-
-        # 优先使用大封面链接
-        if image_link:
-            cover = image_link.get(
-                "href",
-                ""
-            ).strip()
-        else:
-            cover = image.get(
-                "src",
-                ""
-            ).strip()
-
-        if cover:
-            cover = urljoin(
-                JAVBUS_BASE_URL + "/",
-                cover
-            )
-
-        print(
-            f"[标题] {title}"
-        )
-
-        print(
-            f"[封面] {cover}"
-        )
-
-        # 提取所有 script
-        scripts = soup.find_all(
-            "script"
-        )
-
+        title = (image.get("title") or image.get("alt") or code) if image else code
+        cover = (image_link.get("href", "") if image_link else image.get("src", "")).strip()
+        cover = urljoin(f"{JAVBUS_BASE_URL}/", cover) if cover else ""
         ajax_params = None
-
-        print(
-            f"[Script 数量] {len(scripts)}"
-        )
-
-        for index, script in enumerate(
-            scripts,
-            start=1
-        ):
-            script_text = script.get_text(
-                "",
-                strip=False
-            )
-
-            lower_script = script_text.lower()
-
-            # 只检查可能相关的脚本
-            if (
-                "gid" not in lower_script
-                and "uc" not in lower_script
-                and "img" not in lower_script
-            ):
-                continue
-
-            print(
-                f"[发现疑似参数脚本] 第 {index} 个 script，"
-                f"长度：{len(script_text)}"
-            )
-
-            params = extract_ajax_params(
-                script_text
-            )
-
-            if params:
-                ajax_params = params
-
-                print(
-                    "[成功提取 AJAX 参数]",
-                    ajax_params
-                )
-
-                break
-
-        # 如果逐个 script 没找到，再从整个 HTML 搜索一次
+        for script in soup.find_all("script"):
+            script_text = script.get_text("", strip=False)
+            if any(key in script_text.lower() for key in ("gid", "uc", "img")):
+                ajax_params = extract_ajax_params(script_text)
+                if ajax_params:
+                    break
         if not ajax_params:
-            print(
-                "[提示] 单独扫描 script 没找到，"
-                "尝试扫描整个 HTML"
-            )
-
-            ajax_params = extract_ajax_params(
-                html
-            )
-
+            ajax_params = extract_ajax_params(page_html)
         if not ajax_params:
-            raise RuntimeError(
-                "没有找到 gid / uc / img，"
-                "可能是 JavBus 页面结构已改变，"
-                "或者当前返回的是验证页面。"
-                "网页已保存为 debug_page.html"
-            )
+            raise ParseError("页面缺少磁力列表所需参数，目标站页面可能已变化。")
 
-        floor = random.randint(
-            1,
-            1000
-        )
-
-        ajax_url = (
-            f"{JAVBUS_BASE_URL}/ajax/"
-            f"uncledatoolsbyajax.php"
-            f"?gid={ajax_params['gid']}"
-            f"&uc={ajax_params['uc']}"
-            f"&img={ajax_params['img']}"
-            f"&lang=zh"
-            f"&floor={floor}"
-        )
-
-        print(
-            f"[请求 AJAX] {ajax_url}"
-        )
-
+        ajax_url = f"{JAVBUS_BASE_URL}/ajax/uncledatoolsbyajax.php"
         ajax_html = await fetch_text(
             client,
             ajax_url,
-            headers={
-                "Referer": page_url,
-                "X-Requested-With": "XMLHttpRequest",
-            }
+            params={**ajax_params, "lang": "zh", "floor": str(random.randint(1, 1000))},
+            headers={"Referer": page_url, "X-Requested-With": "XMLHttpRequest"},
         )
-
-        # 保存 AJAX 返回内容
-        Path(
-            "debug_ajax.html"
-        ).write_text(
-            ajax_html,
-            encoding="utf-8"
-        )
-
-        print(
-            f"[AJAX 返回长度] {len(ajax_html)} 字符"
-        )
-
-        ajax_soup = BeautifulSoup(
-            ajax_html,
-            "html.parser"
-        )
-
+        await asyncio.to_thread(_save_debug, f"ajax-{code}", ajax_html)
+        ajax_soup = BeautifulSoup(ajax_html, "html.parser")
         magnets = []
+        for row in ajax_soup.select("tr"):
+            link = row.select_one("td:nth-child(2) a")
+            href = link.get("href", "").strip() if link else ""
+            if href:
+                magnets.append({"link": href, "size": link.get_text(" ", strip=True)})
+        return {"code": code, "title": title[:500], "cover": cover, "magnets": magnets}
 
-        for row in ajax_soup.select(
-            "tr"
-        ):
-            link = row.select_one(
-                "td:nth-child(2) a"
+
+async def query_javbus(raw_code: str) -> dict:
+    code = normalize_code(raw_code)
+    cached = await get_cache(code)
+    if cached is not None:
+        return cached
+
+    async with _inflight_guard:
+        task = _inflight.get(code)
+        if task is None:
+            task = asyncio.create_task(_lookup_and_cache(code))
+            _inflight[code] = task
+            task.add_done_callback(
+                lambda finished, lookup_code=code: _lookup_finished(
+                    lookup_code, finished
+                )
             )
+    try:
+        return await asyncio.shield(task)
+    finally:
+        if task.done():
+            async with _inflight_guard:
+                if _inflight.get(code) is task:
+                    _inflight.pop(code, None)
 
-            if not link:
-                continue
 
-            href = link.get(
-                "href",
-                ""
-            ).strip()
+def _lookup_finished(code: str, task: asyncio.Task) -> None:
+    if not task.cancelled():
+        task.exception()  # Retrieve the exception if every waiting caller was cancelled.
+    asyncio.create_task(_remove_finished_lookup(code, task))
 
-            if not href:
-                continue
 
-            magnets.append({
-                "link": unquote(href),
-                "size": link.get_text(
-                    " ",
-                    strip=True
-                ),
-            })
+async def _remove_finished_lookup(code: str, task: asyncio.Task) -> None:
+    async with _inflight_guard:
+        if _inflight.get(code) is task:
+            _inflight.pop(code, None)
 
-        print(
-            f"[Magnet 数量] {len(magnets)}"
-        )
 
-        return {
-            "code": code,
-            "title": title,
-            "cover": cover,
-            "magnets": magnets,
-        }
+async def _lookup_and_cache(code: str) -> dict:
+    cached = await get_cache(code)
+    if cached is not None:
+        return cached
+    await start_http_client()
+    assert _client is not None
+    try:
+        result = await _scrape(code, _client)
+    except JavBusError:
+        raise
+    except Exception as exc:
+        logger.exception("Unexpected lookup error for %s", code)
+        raise FetchError("查询过程中发生内部错误，请稍后重试。") from exc
+    await set_cache(code, result)
+    return result
