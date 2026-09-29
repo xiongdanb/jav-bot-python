@@ -1,0 +1,27 @@
+services:
+  bot:
+    build: .
+    image: jav-bot:latest
+    container_name: jav-bot
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    environment:
+      DATABASE_PATH: /app/data/bot.db
+    volumes:
+      - ./data:/app/data
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: "3"

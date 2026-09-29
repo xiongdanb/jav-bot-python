@@ -8,7 +8,40 @@
 - Telegram Bot Token
 - 可访问配置的 JavBus 站点
 
-## 服务器运行
+## 服务器部署
+
+### Docker Compose
+
+确保服务器已安装 Docker Engine 和 Docker Compose 插件，然后在项目目录执行：
+
+```bash
+cd /opt/jav-bot
+mkdir -p data
+sudo chown -R 10001:10001 data
+cp .env.example .env
+chmod 600 .env
+```
+
+编辑 `.env` 并填写 `BOT_TOKEN`。之后构建并启动容器：
+
+```bash
+docker compose build --pull
+docker compose up -d
+docker compose ps
+docker compose logs -f bot
+```
+
+容器使用非 root 用户运行、只读根文件系统，不映射主机端口；Telegram 长轮询和站点查询使用出站网络。SQLite 数据保存在宿主机 `data/`，容器重建不会删除数据库。`.env` 不会复制进镜像。
+
+更新部署：
+
+```bash
+git pull
+docker compose build
+docker compose up -d
+```
+
+### Python 直接运行
 
 ```bash
 cd /opt/jav-bot
@@ -46,7 +79,7 @@ python -m app.main
 
 出于安全考虑，程序仅请求允许列表中的公网主机，并逐跳校验 HTTP 重定向；如果封面使用 CDN，请把 CDN 主机加入 `UPSTREAM_ALLOWED_HOSTS`。程序不会把完整上游 HTML 写入磁盘。
 
-推荐使用锁定依赖：`pip install -r requirements.lock`。更新依赖后应重新生成并提交锁文件。GitHub Actions 会安装锁文件、检查 Python 编译并运行离线单元测试。
+推荐使用锁定依赖：`pip install -r requirements.lock`。更新依赖后应重新生成并提交锁文件。GitHub Actions 会安装锁文件、检查 Python 编译、运行离线单元测试，并验证 Compose 配置和 Docker 镜像构建。
 
 ## 命令
 
