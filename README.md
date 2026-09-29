@@ -1,6 +1,6 @@
 # Jav Telegram Bot
 
-一个基于 Python、aiogram 和 SQLite 的 Telegram 番号查询机器人。支持 `/av SSIS-001`，返回标题、封面和磁力链接。
+面向 Linux VPS 或服务器常驻运行的 Telegram 番号查询机器人，基于 Python、aiogram 和 SQLite，通过 Telegram 长轮询接收命令，无需部署 Web 服务。发送 `/av SSIS-001` 可查询标题、封面和磁力链接。
 
 ## 环境要求
 
@@ -8,20 +8,23 @@
 - Telegram Bot Token
 - 可访问配置的 JavBus 站点
 
-## 本地运行
+## 服务器运行
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\\Scripts\\Activate.ps1
-pip install -r requirements.txt
-cp .env.example .env       # Windows: Copy-Item .env.example .env
+cd /opt/jav-bot
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.lock
+cp .env.example .env
 ```
 
-编辑 `.env`，至少设置 `BOT_TOKEN`，然后运行：
+编辑 `.env`，至少设置 `BOT_TOKEN`，然后在服务器运行：
 
 ```bash
 python -m app.main
 ```
+
+该命令会以前台进程启动机器人。长期部署时，建议使用 systemd 等服务管理器设置开机启动和异常重启。
 
 ## 配置项
 
