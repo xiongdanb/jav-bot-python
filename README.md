@@ -41,11 +41,11 @@ python -m app.main
 
 出于安全考虑，程序仅请求允许列表中的公网主机，并逐跳校验 HTTP 重定向；如果封面使用 CDN，请把 CDN 主机加入 `UPSTREAM_ALLOWED_HOSTS`。程序不会把完整上游 HTML 写入磁盘。
 
-需要完全固定依赖版本时，使用 `pip install -r requirements.lock`；更新依赖后应重新生成并提交锁文件。
+推荐使用锁定依赖：`pip install -r requirements.lock`。更新依赖后应重新生成并提交锁文件。GitHub Actions 会安装锁文件、检查 Python 编译并运行离线单元测试。
 
 ## 命令
 
 - `/start` 或 `/help`：查看使用方法
 - `/av SSIS-001`：查询番号，也接受 `ssis001`、`SSIS_001` 和 `SSIS 001`
 
-查询结果缓存于 SQLite，默认缓存 6 小时。群聊与私聊使用不同的链接显示上限。
+查询结果默认缓存 30 分钟；群聊与私聊使用不同的链接显示上限。

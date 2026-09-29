@@ -33,6 +33,9 @@ async def init_db():
             chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
             last_query_at INTEGER NOT NULL, PRIMARY KEY (chat_id, user_id)
         )""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS upstream_request_times (
+            requested_at REAL NOT NULL
+        )""")
         await db.execute(
             "DELETE FROM query_cooldowns WHERE last_query_at < ?",
             (int(time.time()) - 86400,),
@@ -74,6 +77,29 @@ async def acquire_query_cooldown(chat_id: int, user_id: int, cooldown: int) -> b
             (chat_id, user_id, now))
         await db.commit()
         return True
+
+
+async def acquire_upstream_request_slot(limit: int, window_seconds: int = 60) -> float:
+    """Return zero when admitted, otherwise seconds to wait; shared by all processes."""
+    now = time.time()
+    async with aiosqlite.connect(DATABASE_PATH, timeout=_DB_TIMEOUT) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        await db.execute(
+            "DELETE FROM upstream_request_times WHERE requested_at <= ?",
+            (now - window_seconds,),
+        )
+        cursor = await db.execute(
+            "SELECT COUNT(*), MIN(requested_at) FROM upstream_request_times"
+        )
+        count, oldest = await cursor.fetchone()
+        if count >= limit:
+            await db.commit()
+            return max(0.05, window_seconds - (now - oldest))
+        await db.execute(
+            "INSERT INTO upstream_request_times(requested_at) VALUES (?)", (now,)
+        )
+        await db.commit()
+        return 0
 
 
 async def get_stats(days: int = 5):

@@ -12,9 +12,11 @@ from bs4 import BeautifulSoup
 from .config import (
     JAVBUS_BASE_URL,
     MAX_CONCURRENT_FETCHES,
+    MAX_UPSTREAM_REQUESTS_PER_MINUTE,
+    MAX_UPSTREAM_RESPONSE_BYTES,
     UPSTREAM_ALLOWED_HOSTS,
 )
-from .database import get_cache, set_cache
+from .database import acquire_upstream_request_slot, get_cache, set_cache
 
 
 logger = logging.getLogger(__name__)
@@ -66,6 +68,7 @@ async def start_http_client() -> None:
             headers=HEADERS,
             timeout=httpx.Timeout(20),
             follow_redirects=False,
+            trust_env=False,
             limits=httpx.Limits(max_connections=MAX_CONCURRENT_FETCHES * 2),
         )
 
@@ -82,7 +85,10 @@ async def download_cover(url: str, referer: str) -> bytes:
     assert _client is not None
     async with _fetch_semaphore:
         response = await _request(
-            _client, url, headers={"Referer": referer, "Accept": "image/*"}
+            _client,
+            url,
+            headers={"Referer": referer, "Accept": "image/*"},
+            max_bytes=10 * 1024 * 1024,
         )
         response.raise_for_status()
         if len(response.content) > 10 * 1024 * 1024:
@@ -127,7 +133,7 @@ async def fetch_text(
     raise FetchError("请求目标站失败，请稍后重试。") from last_error
 
 
-async def _validate_target(url: str) -> None:
+async def _validate_target(url: str) -> list[str]:
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower().rstrip(".")
     if (
@@ -147,11 +153,14 @@ async def _validate_target(url: str) -> None:
         )
     except socket.gaierror as exc:
         raise FetchError("Could not resolve the upstream host.") from exc
-    if not addresses or any(
-        not ipaddress.ip_address(item[4][0].split("%")[0]).is_global
-        for item in addresses
-    ):
+    resolved = [item[4][0].split("%")[0] for item in addresses]
+    try:
+        is_public = all(ipaddress.ip_address(address).is_global for address in resolved)
+    except ValueError as exc:
+        raise FetchError("Upstream host returned an invalid IP address.") from exc
+    if not resolved or not is_public:
         raise FetchError("Upstream host resolves to a non-public IP address.")
+    return resolved
 
 
 async def _request(
@@ -160,23 +169,64 @@ async def _request(
     *,
     params: dict[str, str] | None = None,
     headers: dict[str, str] | None = None,
+    max_bytes: int = MAX_UPSTREAM_RESPONSE_BYTES,
 ) -> httpx.Response:
     current_url = url
     current_params = params
     current_headers = headers
     for redirect_count in range(6):
-        await _validate_target(current_url)
-        response = await client.get(
-            current_url,
+        resolved = await _validate_target(current_url)
+        origin_url = httpx.URL(current_url)
+        origin_host = origin_url.host
+        # Connect to the address that was just validated. Keep the original Host
+        # and TLS SNI so certificates and virtual hosting still use the hostname.
+        pinned_url = origin_url.copy_with(host=resolved[0])
+        request_headers = dict(current_headers or {})
+        request_headers["Host"] = origin_url.netloc.decode("ascii")
+        request = client.build_request(
+            "GET",
+            pinned_url,
             params=current_params,
-            headers=current_headers,
+            headers=request_headers,
+            extensions={"sni_hostname": origin_host.encode("ascii")},
         )
-        if response.status_code not in {301, 302, 303, 307, 308}:
-            return response
-        location = response.headers.get("Location")
-        if not location or redirect_count == 5:
-            raise FetchError("Too many or malformed upstream redirects.")
-        next_url = urljoin(str(response.url), location)
+        while True:
+            wait_seconds = await acquire_upstream_request_slot(
+                MAX_UPSTREAM_REQUESTS_PER_MINUTE
+            )
+            if wait_seconds <= 0:
+                break
+            await asyncio.sleep(wait_seconds)
+        response = await client.send(request, stream=True)
+        try:
+            if response.status_code in {301, 302, 303, 307, 308}:
+                location = response.headers.get("Location")
+                if not location or redirect_count == 5:
+                    raise FetchError("Too many or malformed upstream redirects.")
+                next_url = urljoin(current_url, location)
+            else:
+                content_length = response.headers.get("Content-Length")
+                if content_length and content_length.isdigit() and int(content_length) > max_bytes:
+                    raise FetchError("Upstream response exceeds the configured size limit.")
+                body = bytearray()
+                async for chunk in response.aiter_bytes():
+                    body.extend(chunk)
+                    if len(body) > max_bytes:
+                        raise FetchError("Upstream response exceeds the configured size limit.")
+                safe_headers = {
+                    key: value for key, value in response.headers.items()
+                    if key.lower() not in {"content-length", "content-encoding"}
+                }
+                result = httpx.Response(
+                    response.status_code,
+                    headers=safe_headers,
+                    content=bytes(body),
+                    request=request,
+                    extensions=response.extensions,
+                )
+                return result
+        finally:
+            await response.aclose()
         if urlparse(next_url).hostname != urlparse(current_url).hostname:
             current_headers = {
                 key: value for key, value in (current_headers or {}).items()
