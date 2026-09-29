@@ -83,17 +83,14 @@ async def close_http_client() -> None:
 async def download_cover(url: str, referer: str) -> bytes:
     await start_http_client()
     assert _client is not None
-    async with _fetch_semaphore:
-        response = await _request(
-            _client,
-            url,
-            headers={"Referer": referer, "Accept": "image/*"},
-            max_bytes=10 * 1024 * 1024,
-        )
-        response.raise_for_status()
-        if len(response.content) > 10 * 1024 * 1024:
-            raise FetchError("Cover image exceeds 10 MB.")
-        return response.content
+    response = await _request(
+        _client,
+        url,
+        headers={"Referer": referer, "Accept": "image/*"},
+        max_bytes=10 * 1024 * 1024,
+    )
+    response.raise_for_status()
+    return response.content
 
 
 def normalize_code(raw: str) -> str:
@@ -188,7 +185,7 @@ async def _request(
             pinned_url,
             params=current_params,
             headers=request_headers,
-            extensions={"sni_hostname": origin_host.encode("ascii")},
+            extensions={"sni_hostname": origin_host},
         )
         while True:
             wait_seconds = await acquire_upstream_request_slot(
@@ -197,7 +194,8 @@ async def _request(
             if wait_seconds <= 0:
                 break
             await asyncio.sleep(wait_seconds)
-        response = await client.send(request, stream=True)
+        async with _fetch_semaphore:
+            response = await client.send(request, stream=True)
         try:
             if response.status_code in {301, 302, 303, 307, 308}:
                 location = response.headers.get("Location")
@@ -273,50 +271,49 @@ def _check_blocked(page_html: str) -> None:
 
 async def _scrape(code: str, client: httpx.AsyncClient) -> dict:
     page_url = f"{JAVBUS_BASE_URL}/{code}"
-    async with _fetch_semaphore:
-        page_html = await fetch_text(client, page_url)
-        _check_blocked(page_html)
+    page_html = await fetch_text(client, page_url)
+    _check_blocked(page_html)
 
-        soup = BeautifulSoup(page_html, "html.parser")
-        image_link = soup.select_one("a.bigImage")
-        image = soup.select_one("a.bigImage img")
-        if not image_link and not image:
-            image = soup.select_one("img")
-        if not image_link and not image:
-            if re.search(r"404|not found|不存在", soup.get_text(" ", strip=True), re.I):
-                raise NotFoundError("没有找到这个番号。")
-            raise ParseError("页面中没有找到封面，目标站页面可能已变化。")
+    soup = BeautifulSoup(page_html, "html.parser")
+    image_link = soup.select_one("a.bigImage")
+    image = soup.select_one("a.bigImage img")
+    if not image_link and not image:
+        image = soup.select_one("img")
+    if not image_link and not image:
+        if re.search(r"404|not found|does not exist", soup.get_text(" ", strip=True), re.I):
+            raise NotFoundError("No matching code was found.")
+        raise ParseError("The upstream page no longer matches the expected structure.")
 
-        title = (image.get("title") or image.get("alt") or code) if image else code
-        cover = (image_link.get("href", "") if image_link else image.get("src", "")).strip()
-        cover = urljoin(f"{JAVBUS_BASE_URL}/", cover) if cover else ""
-        ajax_params = None
-        for script in soup.find_all("script"):
-            script_text = script.get_text("", strip=False)
-            if any(key in script_text.lower() for key in ("gid", "uc", "img")):
-                ajax_params = extract_ajax_params(script_text)
-                if ajax_params:
-                    break
-        if not ajax_params:
-            ajax_params = extract_ajax_params(page_html)
-        if not ajax_params:
-            raise ParseError("页面缺少磁力列表所需参数，目标站页面可能已变化。")
+    title = (image.get("title") or image.get("alt") or code) if image else code
+    cover = (image_link.get("href", "") if image_link else image.get("src", "")).strip()
+    cover = urljoin(f"{JAVBUS_BASE_URL}/", cover) if cover else ""
+    ajax_params = None
+    for script in soup.find_all("script"):
+        script_text = script.get_text("", strip=False)
+        if any(key in script_text.lower() for key in ("gid", "uc", "img")):
+            ajax_params = extract_ajax_params(script_text)
+            if ajax_params:
+                break
+    if not ajax_params:
+        ajax_params = extract_ajax_params(page_html)
+    if not ajax_params:
+        raise ParseError("The upstream page is missing magnet-list parameters.")
 
-        ajax_url = f"{JAVBUS_BASE_URL}/ajax/uncledatoolsbyajax.php"
-        ajax_html = await fetch_text(
-            client,
-            ajax_url,
-            params={**ajax_params, "lang": "zh", "floor": str(random.randint(1, 1000))},
-            headers={"Referer": page_url, "X-Requested-With": "XMLHttpRequest"},
-        )
-        ajax_soup = BeautifulSoup(ajax_html, "html.parser")
-        magnets = []
-        for row in ajax_soup.select("tr"):
-            link = row.select_one("td:nth-child(2) a")
-            href = link.get("href", "").strip() if link else ""
-            if href:
-                magnets.append({"link": href, "size": link.get_text(" ", strip=True)})
-        return {"code": code, "title": title[:500], "cover": cover, "magnets": magnets}
+    ajax_url = f"{JAVBUS_BASE_URL}/ajax/uncledatoolsbyajax.php"
+    ajax_html = await fetch_text(
+        client,
+        ajax_url,
+        params={**ajax_params, "lang": "zh", "floor": str(random.randint(1, 1000))},
+        headers={"Referer": page_url, "X-Requested-With": "XMLHttpRequest"},
+    )
+    ajax_soup = BeautifulSoup(ajax_html, "html.parser")
+    magnets = []
+    for row in ajax_soup.select("tr"):
+        link = row.select_one("td:nth-child(2) a")
+        href = link.get("href", "").strip() if link else ""
+        if href:
+            magnets.append({"link": href, "size": link.get_text(" ", strip=True)})
+    return {"code": code, "title": title[:500], "cover": cover, "magnets": magnets}
 
 
 async def query_javbus(raw_code: str) -> dict:

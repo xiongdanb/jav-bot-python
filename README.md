@@ -35,6 +35,8 @@ python -m app.main
 | `GROUP_MAX_MAGNETS` | `3` | 群聊最多显示的磁力链接数 |
 | `PRIVATE_MAX_MAGNETS` | `20` | 私聊最多显示的磁力链接数 |
 | `MAX_CONCURRENT_FETCHES` | `3` | 同时进行的上游请求上限 |
+| `MAX_UPSTREAM_REQUESTS_PER_MINUTE` | `60` | 跨进程共享的上游每分钟请求上限 |
+| `MAX_UPSTREAM_RESPONSE_BYTES` | `5242880` | 页面和 AJAX 响应解压后的最大字节数 |
 | `USER_COOLDOWN_SECONDS` | `3` | 同一用户在同一聊天的查询间隔 |
 | `STATISTICS_TIMEZONE` | `Asia/Shanghai` | 每日统计所用 IANA 时区 |
 | `TELEGRAM_SEND_CONCURRENCY` | `2` | 同时发送结果的聊天数上限 |
