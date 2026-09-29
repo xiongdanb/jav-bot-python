@@ -20,6 +20,7 @@ from .database import acquire_upstream_request_slot, get_cache, set_cache
 
 
 logger = logging.getLogger(__name__)
+_MAX_MAGNETS_PER_RESULT = 100
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -177,25 +178,36 @@ async def _request(
         origin_host = origin_url.host
         # Connect to the address that was just validated. Keep the original Host
         # and TLS SNI so certificates and virtual hosting still use the hostname.
-        pinned_url = origin_url.copy_with(host=resolved[0])
         request_headers = dict(current_headers or {})
         request_headers["Host"] = origin_url.netloc.decode("ascii")
-        request = client.build_request(
-            "GET",
-            pinned_url,
-            params=current_params,
-            headers=request_headers,
-            extensions={"sni_hostname": origin_host},
-        )
-        while True:
-            wait_seconds = await acquire_upstream_request_slot(
-                MAX_UPSTREAM_REQUESTS_PER_MINUTE
+        response = None
+        request = None
+        last_connection_error = None
+        for address in resolved:
+            pinned_url = origin_url.copy_with(host=address)
+            request = client.build_request(
+                "GET",
+                pinned_url,
+                params=current_params,
+                headers=request_headers,
+                extensions={"sni_hostname": origin_host},
             )
-            if wait_seconds <= 0:
+            while True:
+                wait_seconds = await acquire_upstream_request_slot(
+                    MAX_UPSTREAM_REQUESTS_PER_MINUTE
+                )
+                if wait_seconds <= 0:
+                    break
+                await asyncio.sleep(wait_seconds)
+            try:
+                async with _fetch_semaphore:
+                    response = await client.send(request, stream=True)
                 break
-            await asyncio.sleep(wait_seconds)
-        async with _fetch_semaphore:
-            response = await client.send(request, stream=True)
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                last_connection_error = exc
+        if response is None:
+            assert last_connection_error is not None
+            raise last_connection_error
         try:
             if response.status_code in {301, 302, 303, 307, 308}:
                 location = response.headers.get("Location")
@@ -313,6 +325,8 @@ async def _scrape(code: str, client: httpx.AsyncClient) -> dict:
         href = link.get("href", "").strip() if link else ""
         if href:
             magnets.append({"link": href, "size": link.get_text(" ", strip=True)})
+            if len(magnets) >= _MAX_MAGNETS_PER_RESULT:
+                break
     return {"code": code, "title": title[:500], "cover": cover, "magnets": magnets}
 
 

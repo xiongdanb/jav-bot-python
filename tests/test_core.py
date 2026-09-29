@@ -30,6 +30,32 @@ class ParsingTests(unittest.TestCase):
 
 
 class RequestSafetyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_connect_fails_over_to_next_validated_ip(self):
+        attempted = []
+
+        async def handler(request):
+            attempted.append(request)
+            if request.url.host == "93.184.216.34":
+                raise httpx.ConnectError("unreachable", request=request)
+            return httpx.Response(200, content=b"ok", request=request)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), trust_env=False
+        ) as client:
+            with (
+                patch(
+                    "app.javbus._validate_target",
+                    new=AsyncMock(return_value=["93.184.216.34", "1.1.1.1"]),
+                ),
+                patch("app.javbus.acquire_upstream_request_slot", new=AsyncMock(return_value=0)),
+            ):
+                response = await _request(client, "https://site.example/page")
+
+        self.assertEqual(response.text, "ok")
+        self.assertEqual([request.url.host for request in attempted], ["93.184.216.34", "1.1.1.1"])
+        self.assertEqual(attempted[1].headers["host"], "site.example")
+        self.assertEqual(attempted[1].extensions["sni_hostname"], "site.example")
+
     async def test_connect_uses_validated_ip_and_original_tls_name(self):
         requests = []
 
@@ -338,6 +364,27 @@ class SQLiteCoordinationTests(unittest.IsolatedAsyncioTestCase):
     async def test_global_request_quota_is_shared_in_sqlite(self):
         self.assertEqual(await database.acquire_upstream_request_slot(1), 0)
         self.assertGreater(await database.acquire_upstream_request_slot(1), 0)
+
+
+class ScrapeLimitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_scrape_caps_magnet_rows(self):
+        page_html = (
+            '<a class="bigImage" href="/cover.jpg"><img title="title"></a>'
+            '<script>var gid = 1; var uc = 2; var img = "x";</script>'
+        )
+        rows = "".join(
+            f'<tr><td>row</td><td><a href="magnet:?xt={index}">{index} MB</a></td></tr>'
+            for index in range(javbus._MAX_MAGNETS_PER_RESULT + 5)
+        )
+        with patch("app.javbus.fetch_text", new=AsyncMock(side_effect=[page_html, rows])):
+            result = await javbus._scrape("SSIS-001", client=None)
+
+        self.assertEqual(len(result["magnets"]), javbus._MAX_MAGNETS_PER_RESULT)
+        self.assertEqual(result["magnets"][0]["link"], "magnet:?xt=0")
+        self.assertEqual(
+            result["magnets"][-1]["link"],
+            f"magnet:?xt={javbus._MAX_MAGNETS_PER_RESULT - 1}",
+        )
 
 
 if __name__ == "__main__":
